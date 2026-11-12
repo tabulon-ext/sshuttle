@@ -1,10 +1,12 @@
 import errno
+import ipaddress
 import re
 import signal
 import time
 import subprocess as ssubprocess
 import os
 import sys
+import base64
 import platform
 
 import sshuttle.helpers as helpers
@@ -14,13 +16,17 @@ import sshuttle.ssyslog as ssyslog
 import sshuttle.sdnotify as sdnotify
 from sshuttle.ssnet import SockWrapper, Handler, Proxy, Mux, MuxWrapper
 from sshuttle.helpers import log, debug1, debug2, debug3, Fatal, islocal, \
-    resolvconf_nameservers, which
+    resolvconf_nameservers, which, is_admin_user, RWPair
 from sshuttle.methods import get_method, Features
 from sshuttle import __version__
 try:
     from pwd import getpwnam
 except ImportError:
     getpwnam = None
+try:
+    from grp import getgrnam
+except ImportError:
+    getgrnam = None
 
 import socket
 
@@ -113,6 +119,18 @@ def daemon_cleanup():
             raise
 
 
+def ipv6_supported():
+    """False when the kernel has no IPv6 at all (e.g. Linux booted with
+    ipv6.disable=1), so not even an IPv6 socket can be created."""
+    try:
+        socket.socket(socket.AF_INET6, socket.SOCK_STREAM).close()
+    except OSError as e:
+        if e.errno != errno.EAFNOSUPPORT:
+            raise
+        return False
+    return True
+
+
 class MultiListener:
 
     def __init__(self, kind=socket.SOCK_STREAM, proto=0):
@@ -123,14 +141,14 @@ class MultiListener:
         self.bind_called = False
 
     def setsockopt(self, level, optname, value):
-        assert(self.bind_called)
+        assert self.bind_called
         if self.v6:
             self.v6.setsockopt(level, optname, value)
         if self.v4:
             self.v4.setsockopt(level, optname, value)
 
     def add_handler(self, handlers, callback, method, mux):
-        assert(self.bind_called)
+        assert self.bind_called
         socks = []
         if self.v6:
             socks.append(self.v6)
@@ -145,36 +163,56 @@ class MultiListener:
         )
 
     def listen(self, backlog):
-        assert(self.bind_called)
+        assert self.bind_called
         if self.v6:
             self.v6.listen(backlog)
         if self.v4:
-            try:
-                self.v4.listen(backlog)
-            except socket.error as e:
-                # on some systems v4 bind will fail if the v6 succeeded,
-                # in this case the v6 socket will receive v4 too.
-                if e.errno == errno.EADDRINUSE and self.v6:
-                    self.v4 = None
-                else:
-                    raise e
+            self.v4.listen(backlog)
+
+    def close(self):
+        if self.v6:
+            self.v6.close()
+        if self.v4:
+            self.v4.close()
 
     def bind(self, address_v6, address_v4):
-        assert(not self.bind_called)
+        assert not self.bind_called
         self.bind_called = True
         if address_v6 is not None:
             self.v6 = socket.socket(socket.AF_INET6, self.type, self.proto)
-            self.v6.bind(address_v6)
+            if os.name == "posix" and self.type == socket.SOCK_STREAM:
+                self.v6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if address_v4 is not None:
+                # IPv4 has its own listener; do not let IPv6 claim its port.
+                self.v6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            try:
+                self.v6.bind(address_v6)
+            except OSError as e:
+                if e.errno == errno.EADDRNOTAVAIL:
+                    # On an IPv6 Linux machine, this situation occurs
+                    # if you run the following prior to running
+                    # sshuttle:
+                    #
+                    # echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
+                    # echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6
+                    raise Fatal("Could not bind to an IPv6 socket with "
+                                "address %s and port %s. "
+                                "Potential workaround: Run sshuttle "
+                                "with '--disable-ipv6'."
+                                % (str(address_v6[0]), str(address_v6[1])))
+                raise e
         else:
             self.v6 = None
         if address_v4 is not None:
             self.v4 = socket.socket(socket.AF_INET, self.type, self.proto)
+            if os.name == "posix" and self.type == socket.SOCK_STREAM:
+                self.v4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.v4.bind(address_v4)
         else:
             self.v4 = None
 
     def print_listening(self, what):
-        assert(self.bind_called)
+        assert self.bind_called
         if self.v6:
             listenip = self.v6.getsockname()
             debug1('%s listening on %r.' % (what, listenip))
@@ -187,69 +225,192 @@ class MultiListener:
 
 class FirewallClient:
 
-    def __init__(self, method_name, sudo_pythonpath):
+    def __init__(self, method_name, sudo_pythonpath, flush_dns=True):
         self.auto_nets = []
 
-        argvbase = ([sys.executable, sys.argv[0]] +
+        argv0 = sys.argv[0]
+        # argv0 is either be a normal Python file or an executable.
+        # After installed as a package, sshuttle command points to an .exe in Windows and Python shebang script elsewhere.
+        argvbase = (([sys.executable, sys.argv[0]] if argv0.endswith('.py') else [argv0]) +
                     ['-v'] * (helpers.verbose or 0) +
                     ['--method', method_name] +
                     ['--firewall'])
         if ssyslog._p:
             argvbase += ['--syslog']
+        if not flush_dns:
+            argvbase += ['--no-flush-dns']
 
-        # Determine how to prefix the command in order to elevate privileges.
-        if platform.platform().startswith('OpenBSD'):
-            elev_prefix = ['doas']  # OpenBSD uses built in `doas`
+        # A list of commands that we can try to run to start the firewall.
+        argv_tries = []
+
+        if is_admin_user():  # No need to elevate privileges
+            argv_tries.append(argvbase)
         else:
-            elev_prefix = ['sudo', '-p', '[local sudo] Password: ']
+            if sys.platform == 'win32':
+                # runas_path = which("runas")
+                # if runas_path:
+                #   argv_tries.append([runas_path , '/noprofile', '/user:Administrator',  'python'])
+                # XXX: Attempt to elevate privilege using 'runas' in windows seems not working.
+                # Because underlying ShellExecute() Windows api does not allow child process to inherit stdio.
+                # TODO(nom3ad): Try to implement another way to achieve this.
+                raise Fatal("Privilege elevation for Windows is not yet implemented. Please run from an administrator shell")
 
-        # Look for binary and switch to absolute path if we can find
-        # it.
-        path = which(elev_prefix[0])
-        if path:
-            elev_prefix[0] = path
+            # Linux typically uses sudo; OpenBSD uses doas. However, some
+            # Linux distributions are starting to use doas.
+            sudo_cmd = ['sudo', '-p', '[local sudo] Password: ']
+            doas_cmd = ['doas']
 
-        if sudo_pythonpath:
-            elev_prefix += ['/usr/bin/env',
-                            'PYTHONPATH=%s' %
-                            os.path.dirname(os.path.dirname(__file__))]
-        argv_tries = [elev_prefix + argvbase, argvbase]
+            # For clarity, try to replace executable name with the
+            # full path.
+            doas_path = which("doas")
+            if doas_path:
+                doas_cmd[0] = doas_path
+            sudo_path = which("sudo")
+            if sudo_path:
+                sudo_cmd[0] = sudo_path
 
-        # we can't use stdin/stdout=subprocess.PIPE here, as we normally would,
-        # because stupid Linux 'su' requires that stdin be attached to a tty.
-        # Instead, attach a *bidirectional* socket to its stdout, and use
-        # that for talking in both directions.
-        (s1, s2) = socket.socketpair()
+            # sudo_pythonpath indicates if we should set the
+            # PYTHONPATH environment variable when elevating
+            # privileges. This can be adjusted with the
+            # --no-sudo-pythonpath option.
+            if sudo_pythonpath:
+                pp_prefix = ['/usr/bin/env',
+                             'PYTHONPATH=%s' %
+                             os.path.dirname(os.path.dirname(__file__))]
+                sudo_cmd = sudo_cmd + pp_prefix
+                doas_cmd = doas_cmd + pp_prefix
 
-        def setup():
-            # run in the child process
-            s2.close()
-        if os.getuid() == 0:
-            argv_tries = argv_tries[-1:]  # last entry only
+            # Final order should be: sudo/doas command, env
+            # pythonpath, and then argvbase (sshuttle command).
+            sudo_cmd = sudo_cmd + argvbase
+            doas_cmd = doas_cmd + argvbase
+
+            # If we can find doas and not sudo or if we are on
+            # OpenBSD, try using doas first.
+            if (doas_path and not sudo_path) or platform.platform().startswith('OpenBSD'):
+                argv_tries = [doas_cmd, sudo_cmd, argvbase]
+            else:
+                argv_tries = [sudo_cmd, doas_cmd, argvbase]
+
+        # Try all commands in argv_tries in order. If a command
+        # produces an error, try the next one. If command is
+        # successful, set 'success' variable and break.
+        success = False
         for argv in argv_tries:
+
+            if sys.platform != 'win32':
+                # we can't use stdin/stdout=subprocess.PIPE here, as we
+                # normally would, because stupid Linux 'su' requires that
+                # stdin be attached to a tty. Instead, attach a
+                # *bidirectional* socket to its stdout, and use that for
+                # talking in both directions.
+                (s1, s2) = socket.socketpair()
+                pstdout = s1
+                pstdin = s1
+                penv = None
+
+                def preexec_fn():
+                    # run in the child process
+                    s2.close()
+
+                def get_pfile():
+                    s1.close()
+                    return s2.makefile('rwb')
+
+            else:
+                # In Windows CPython, BSD sockets are not supported as subprocess stdio.
+                # if client (and firewall) processes is running as admin user, pipe based stdio can be used for communication.
+                # But if firewall process is spwaned in elevated mode by non-admin client process, access to stdio is lost.
+                # To work around this, we can use a socketpair.
+                # But socket need to be "shared" to child process as it can't be directly set as stdio.
+                can_use_stdio = is_admin_user()
+
+                preexec_fn = None
+                penv = os.environ.copy()
+                if can_use_stdio:
+                    pstdout = ssubprocess.PIPE
+                    pstdin = ssubprocess.PIPE
+
+                    def get_pfile():
+                        return RWPair(self.p.stdout, self.p.stdin)
+                    penv['SSHUTTLE_FW_COM_CHANNEL'] = 'stdio'
+                else:
+                    pstdout = None
+                    pstdin = None
+                    (s1, s2) = socket.socketpair()
+                    socket_share_data = s1.share(self.p.pid)
+                    socket_share_data_b64 = base64.b64encode(socket_share_data)
+                    penv['SSHUTTLE_FW_COM_CHANNEL'] = socket_share_data_b64
+
+                    def get_pfile():
+                        s1.close()
+                        return s2.makefile('rwb')
             try:
-                if argv[0] == 'su':
-                    sys.stderr.write('[local su] ')
-                self.p = ssubprocess.Popen(argv, stdout=s1, preexec_fn=setup)
+                debug1("Starting firewall manager with command: %r" % argv)
+                self.p = ssubprocess.Popen(argv, stdout=pstdout, stdin=pstdin, env=penv,
+                                           preexec_fn=preexec_fn)
                 # No env: Talking to `FirewallClient.start`, which has no i18n.
-                break
             except OSError as e:
-                log('Spawning firewall manager: %r' % argv)
-                raise Fatal(e)
-        self.argv = argv
-        s1.close()
-        self.pfile = s2.makefile('rwb')
-        line = self.pfile.readline()
-        self.check()
-        if line[0:5] != b'READY':
-            raise Fatal('%r expected READY, got %r' % (self.argv, line))
-        method_name = line[6:-1]
-        self.method = get_method(method_name.decode("ASCII"))
-        self.method.set_firewall(self)
+                # This exception will occur if the program isn't
+                # present or isn't executable.
+                debug1('Unable to start firewall manager. Popen failed. '
+                       'Command=%r Exception=%s' % (argv, e))
+                continue
+            self.argv = argv
+            self.pfile = get_pfile()
+
+            try:
+                line = self.pfile.readline()
+            except IOError:
+                # happens when firewall subprocess exists
+                line = ''
+
+            rv = self.p.poll()   # Check if process is still running
+            if rv:
+                # We might get here if program runs and exits before
+                # outputting anything. For example, someone might have
+                # entered the wrong password to elevate privileges.
+                debug1('Unable to start firewall manager. '
+                       'Process exited too early. '
+                       '%r returned %d' % (self.argv, rv))
+                continue
+
+            # Normally, READY will be the first text on the first
+            # line. However, if an administrator replaced sudo with a
+            # shell script that echos a message to stdout and then
+            # runs sudo, READY won't be on the first line. To
+            # workaround this problem, we read a limited number of
+            # lines until we encounter "READY". Store all of the text
+            # we skipped in case we need it for an error message.
+            #
+            # A proper way to print a sudo warning message is to use
+            # sudo's lecture feature. sshuttle works correctly without
+            # this hack if sudo's lecture feature is used instead.
+            skipped_text = line
+            for i in range(100):
+                if line[0:5] == b'READY':
+                    break
+                line = self.pfile.readline()
+                skipped_text += line
+
+            if line[0:5] != b'READY':
+                debug1('Unable to start firewall manager. '
+                       'Expected READY, got %r. '
+                       'Command=%r' % (skipped_text, self.argv))
+                continue
+
+            method_name = line[6:-1]
+            self.method = get_method(method_name.decode("ASCII"))
+            self.method.set_firewall(self)
+            success = True
+            break
+
+        if not success:
+            raise Fatal("All attempts to run firewall client process with elevated privileges were failed.")
 
     def setup(self, subnets_include, subnets_exclude, nslist,
               redirectport_v6, redirectport_v4, dnsport_v6, dnsport_v4, udp,
-              user, tmark):
+              user, group, tmark):
         self.subnets_include = subnets_include
         self.subnets_exclude = subnets_exclude
         self.nslist = nslist
@@ -259,6 +420,7 @@ class FirewallClient:
         self.dnsport_v4 = dnsport_v4
         self.udp = udp
         self.user = user
+        self.group = group
         self.tmark = tmark
 
     def check(self):
@@ -266,10 +428,26 @@ class FirewallClient:
         if rv:
             raise Fatal('%r returned %d' % (self.argv, rv))
 
+    def _auto_nets_not_excluded(self):
+        # The firewall gives priority to the most specific subnet, so an
+        # auto net inside an excluded subnet would override the exclusion.
+        excluded = [ipaddress.ip_network(f'{ip}/{width}', strict=False)
+                    for (_, ip, width, fport, lport) in self.subnets_exclude
+                    if not fport and not lport]
+        auto_nets = []
+        for (family, ip, width, fport, lport) in self.auto_nets:
+            net = ipaddress.ip_network(f'{ip}/{width}', strict=False)
+            if any(net.version == ex.version and net.subnet_of(ex)
+                   for ex in excluded):
+                debug2(f"Ignored excluded auto net {family}/{ip}/{width}")
+            else:
+                auto_nets.append((family, ip, width, fport, lport))
+        return auto_nets
+
     def start(self):
         self.pfile.write(b'ROUTES\n')
         for (family, ip, width, fport, lport) \
-                in self.subnets_include + self.auto_nets:
+                in self.subnets_include + self._auto_nets_not_excluded():
             self.pfile.write(b'%d,%d,0,%s,%d,%d\n' % (family, width,
                                                       ip.encode("ASCII"),
                                                       fport, lport))
@@ -297,9 +475,14 @@ class FirewallClient:
             user = bytes(self.user, 'utf-8')
         else:
             user = b'%d' % self.user
-
-        self.pfile.write(b'GO %d %s %s\n' %
-                         (udp, user, bytes(self.tmark, 'ascii')))
+        if self.group is None:
+            group = b'-'
+        elif isinstance(self.group, str):
+            group = bytes(self.group, 'utf-8')
+        else:
+            group = b'%d' % self.group
+        self.pfile.write(b'GO %d %s %s %s %d\n' %
+                         (udp, user, group, bytes(self.tmark, 'ascii'), os.getpid()))
         self.pfile.flush()
 
         line = self.pfile.readline()
@@ -308,8 +491,8 @@ class FirewallClient:
             raise Fatal('%r expected STARTED, got %r' % (self.argv, line))
 
     def sethostip(self, hostname, ip):
-        assert(not re.search(br'[^-\w\.]', hostname))
-        assert(not re.search(br'[^0-9.]', ip))
+        assert not re.search(br'[^-\w\.]', hostname)
+        assert not re.search(br'[^0-9.]', ip)
         self.pfile.write(b'HOST %s,%s\n' % (hostname, ip))
         self.pfile.flush()
 
@@ -388,7 +571,11 @@ def udp_done(chan, data, method, sock, dstip):
     (src, srcport, data) = data.split(b",", 2)
     srcip = (src, int(srcport))
     debug3('doing send from %r to %r' % (srcip, dstip,))
-    method.send_udp(sock, srcip, dstip, data)
+    try:
+        method.send_udp(sock, srcip, dstip, data)
+    except OSError as e:
+        # One undeliverable datagram should not take the tunnel down.
+        log('WARNING: failed to send UDP reply to %r: %s' % (dstip, e))
 
 
 def onaccept_udp(listener, method, mux, handlers):
@@ -417,7 +604,12 @@ def dns_done(chan, data, method, sock, srcip, dstip, mux):
     debug3('dns_done: channel=%d src=%r dst=%r' % (chan, srcip, dstip))
     del mux.channels[chan]
     del dnsreqs[chan]
-    method.send_udp(sock, srcip, dstip, data)
+    try:
+        method.send_udp(sock, srcip, dstip, data)
+    except OSError as e:
+        # The client that asked may be unreachable by now, e.g. after the
+        # local network changed. Drop this reply instead of crashing.
+        log('WARNING: failed to send DNS reply to %r: %s' % (dstip, e))
 
 
 def ondns(listener, method, mux, handlers):
@@ -444,7 +636,7 @@ def ondns(listener, method, mux, handlers):
 def _main(tcp_listener, udp_listener, fw, ssh_cmd, remotename,
           python, latency_control, latency_buffer_size,
           dns_listener, seed_hosts, auto_hosts, auto_nets, daemon,
-          to_nameserver):
+          to_nameserver, add_cmd_delimiter, remote_shell):
 
     helpers.logprefix = 'c : '
     debug1('Starting client with Python version %s'
@@ -456,9 +648,11 @@ def _main(tcp_listener, udp_listener, fw, ssh_cmd, remotename,
     debug1('Connecting to server...')
 
     try:
-        (serverproc, serversock) = ssh.connect(
+        (serverproc, rfile, wfile) = ssh.connect(
             ssh_cmd, remotename, python,
             stderr=ssyslog._p and ssyslog._p.stdin,
+            add_cmd_delimiter=add_cmd_delimiter,
+            remote_shell=remote_shell,
             options=dict(latency_control=latency_control,
                          latency_buffer_size=latency_buffer_size,
                          auto_hosts=auto_hosts,
@@ -466,24 +660,25 @@ def _main(tcp_listener, udp_listener, fw, ssh_cmd, remotename,
                          auto_nets=auto_nets))
     except socket.error as e:
         if e.args[0] == errno.EPIPE:
-            raise Fatal("failed to establish ssh session (1)")
+            debug3('Error: EPIPE: ' + repr(e))
+            raise Fatal("SSH connection lost: broken pipe (server may have terminated unexpectedly)")
         else:
             raise
-    mux = Mux(serversock.makefile("rb"), serversock.makefile("wb"))
+    mux = Mux(rfile, wfile)
     handlers.append(mux)
 
     expected = b'SSHUTTLE0001'
-
     try:
         v = 'x'
         while v and v != b'\0':
-            v = serversock.recv(1)
+            v = rfile.read(1)
         v = 'x'
         while v and v != b'\0':
-            v = serversock.recv(1)
-        initstring = serversock.recv(len(expected))
+            v = rfile.read(1)
+        initstring = rfile.read(len(expected))
     except socket.error as e:
         if e.args[0] == errno.ECONNRESET:
+            debug3('Error: ECONNRESET ' + repr(e))
             raise Fatal("failed to establish ssh session (2)")
         else:
             raise
@@ -660,7 +855,8 @@ def main(listenip_v6, listenip_v4,
          latency_buffer_size, dns, nslist,
          method_name, seed_hosts, auto_hosts, auto_nets,
          subnets_include, subnets_exclude, daemon, to_nameserver, pidfile,
-         user, sudo_pythonpath, tmark):
+         user, group, sudo_pythonpath, add_cmd_delimiter, remote_shell, tmark,
+         flush_dns=True):
 
     if not remotename:
         raise Fatal("You must use -r/--remote to specify a remote "
@@ -675,7 +871,7 @@ def main(listenip_v6, listenip_v4,
     debug1('Starting sshuttle proxy (version %s).' % __version__)
     helpers.logprefix = 'c : '
 
-    fw = FirewallClient(method_name, sudo_pythonpath)
+    fw = FirewallClient(method_name, sudo_pythonpath, flush_dns=flush_dns)
 
     # nslist is the list of name severs to intercept. If --dns is
     # used, we add all DNS servers in resolv.conf. Otherwise, the list
@@ -725,7 +921,8 @@ def main(listenip_v6, listenip_v4,
 
     # listenip_v4 contains user specified value or it is set to "auto".
     if listenip_v4 == "auto":
-        listenip_v4 = ('127.0.0.1', 0)
+        listenip_v4 = ('127.0.0.1' if avail.loopback_proxy_port else '0.0.0.0', 0)
+        debug1("Using default IPv4 listen address " + listenip_v4[0])
 
     # listenip_v6 is...
     #    None when IPv6 is disabled.
@@ -734,9 +931,12 @@ def main(listenip_v6, listenip_v4,
     if listenip_v6 is None:
         debug1("IPv6 disabled by --disable-ipv6")
     if listenip_v6 == "auto":
-        if avail.ipv6:
-            debug1("IPv6 enabled: Using default IPv6 listen address ::1")
-            listenip_v6 = ('::1', 0)
+        if avail.ipv6 and not ipv6_supported():
+            debug1("IPv6 disabled since this system does not support it.")
+            listenip_v6 = None
+        elif avail.ipv6:
+            listenip_v6 = ('::1' if avail.loopback_proxy_port else '::', 0)
+            debug1("IPv6 enabled: Using default IPv6 listen address " + listenip_v6[0])
         else:
             debug1("IPv6 disabled since it isn't supported by method "
                    "%s." % fw.method.name)
@@ -762,6 +962,15 @@ def main(listenip_v6, listenip_v4,
         except KeyError:
             raise Fatal("User %s does not exist." % user)
     required.user = False if user is None else True
+
+    if group is not None:
+        if getgrnam is None:
+            raise Fatal("Routing by group not available on this system.")
+        try:
+            group = getgrnam(group).gr_gid
+        except KeyError:
+            raise Fatal("Group %s does not exist." % group)
+    required.group = False if group is None else True
 
     if not required.ipv6 and len(subnets_v6) > 0:
         print("WARNING: IPv6 subnets were ignored because IPv6 is disabled "
@@ -819,9 +1028,10 @@ def main(listenip_v6, listenip_v4,
     feature_status("UDP ", required.udp, avail.udp)
     feature_status("DNS ", required.dns, avail.dns)
     feature_status("User", required.user, avail.user)
+    feature_status("Group", required.group, avail.group)
 
     # Exclude traffic destined to our listen addresses.
-    if required.ipv4 and \
+    if required.ipv4 and listenip_v4 and \
             not any(listenip_v4[0] == sex[1] for sex in subnets_v4):
         subnets_exclude.append((socket.AF_INET, listenip_v4[0], 32, 0, 0))
 
@@ -829,6 +1039,37 @@ def main(listenip_v6, listenip_v4,
             not any(listenip_v6[0] == sex[1] for sex in subnets_v6):
         subnets_exclude.append((socket.AF_INET6, listenip_v6[0], 128, 0, 0))
 
+    # Exclude remote server IP
+    host, proxy_host, proxy_command = ssh.parse_hostname(remotename)
+    hosts_to_exclude = []
+    if proxy_command:
+        debug1(
+            "Warning: ProxyCommand is configured; skipping automatic remote IP exclusion. "
+            "Use -x explicitly if required.\n"
+        )
+    elif proxy_host:
+        hosts_to_exclude.append(proxy_host)
+    elif host:
+        hosts_to_exclude.append(host)
+    for host in hosts_to_exclude:
+        try:
+            addrinfo = socket.getaddrinfo(host, None, 0, socket.SOCK_STREAM)
+            for family, _, _, _, sockaddr in addrinfo:
+                if family == socket.AF_INET6 and not required.ipv6:
+                    # No IPv6 traffic is redirected, so there is nothing
+                    # to exclude, and an IPv6 entry would make the
+                    # firewall set up IPv6 rules after all.
+                    continue
+                remote_ip = sockaddr[0]
+
+                # Strip IPv6 scope suffix, e.g. fe80::1%eth0
+                if family == socket.AF_INET6:
+                    remote_ip = remote_ip.split('%', 1)[0]
+
+                if not any(remote_ip == sex[1] for sex in subnets_exclude):
+                    subnets_exclude.append((family, remote_ip, 32 if family == socket.AF_INET else 128, 0, 0))
+        except Exception as e:
+            debug1(f"Failed to exclude remote IP: {e}\n")
     # We don't print the IP+port of where we are listening here
     # because we do that below when we have identified the ports to
     # listen on.
@@ -848,15 +1089,15 @@ def main(listenip_v6, listenip_v4,
         for i in nslist:
             debug1("  "+str(i))
 
-    if listenip_v6 and listenip_v6[1] and listenip_v4 and listenip_v4[1]:
-        # if both ports given, no need to search for a spare port
+    # Track actual listener ports, including explicitly configured ports.
+    used_ports = set()
+    if not any(address and not address[1]
+               for address in (listenip_v6, listenip_v4)):
+        # All enabled listeners have explicit ports; try only once.
         ports = [0, ]
     else:
         # if at least one port missing, we have to search
         ports = range(12300, 9000, -1)
-        # keep track of failed bindings and used ports to avoid trying to
-        # bind to the same socket address twice in different listeners
-        used_ports = []
 
     # search for free ports and try to bind
     last_e = None
@@ -896,20 +1137,27 @@ def main(listenip_v6, listenip_v4,
             tcp_listener.bind(lv6, lv4)
             if udp_listener:
                 udp_listener.bind(lv6, lv4)
+            # With SO_REUSEADDR, a port another process just bound may only
+            # be reported as busy here, so this has to stay in the search.
+            tcp_listener.listen(10)
             bound = True
-            used_ports.append(port)
+            used_ports.update(p for p in (redirectport_v6, redirectport_v4) if p)
             break
         except socket.error as e:
             if e.errno == errno.EADDRINUSE:
                 last_e = e
-                used_ports.append(port)
+                used_ports.update(p for p in (redirectport_v6, redirectport_v4) if p)
+                # last_e keeps this attempt's sockets alive through its
+                # traceback, and one of them may already be listening.
+                tcp_listener.close()
+                if udp_listener:
+                    udp_listener.close()
             else:
                 raise e
 
     if not bound:
-        assert(last_e)
+        assert last_e
         raise last_e
-    tcp_listener.listen(10)
     tcp_listener.print_listening("TCP redirector")
     if udp_listener:
         udp_listener.print_listening("UDP redirector")
@@ -942,18 +1190,18 @@ def main(listenip_v6, listenip_v4,
             try:
                 dns_listener.bind(lv6, lv4)
                 bound = True
-                used_ports.append(port)
+                used_ports.add(port)
                 break
             except socket.error as e:
                 if e.errno == errno.EADDRINUSE:
                     last_e = e
-                    used_ports.append(port)
+                    used_ports.add(port)
                 else:
                     raise e
 
         dns_listener.print_listening("DNS")
         if not bound:
-            assert(last_e)
+            assert last_e
             raise last_e
     else:
         dnsport_v6 = 0
@@ -992,14 +1240,14 @@ def main(listenip_v6, listenip_v4,
     # start the firewall
     fw.setup(subnets_include, subnets_exclude, nslist,
              redirectport_v6, redirectport_v4, dnsport_v6, dnsport_v4,
-             required.udp, user, tmark)
+             required.udp, user, group, tmark)
 
     # start the client process
     try:
         return _main(tcp_listener, udp_listener, fw, ssh_cmd, remotename,
                      python, latency_control, latency_buffer_size,
                      dns_listener, seed_hosts, auto_hosts, auto_nets,
-                     daemon, to_nameserver)
+                     daemon, to_nameserver, add_cmd_delimiter, remote_shell)
     finally:
         try:
             if daemon:

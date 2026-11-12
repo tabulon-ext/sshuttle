@@ -11,10 +11,9 @@ Forward all traffic::
     sshuttle -r username@sshserver 0.0.0.0/0
 
 - Use the :option:`sshuttle -r` parameter to specify a remote server.
-  One some systems, you may also need to use the :option:`sshuttle -x`
-  parameter to exclude sshserver or sshserver:22 so that your local
-  machine can communicate directly to sshserver without it being
-  redirected by sshuttle.
+  The SSH connection endpoint is automatically excluded from forwarding.
+  When `ProxyCommand` is configured, automatic exclusion is skipped;
+  use :option:`sshuttle -x` to exclude the required address manually.
 
 - By default sshuttle will automatically choose a method to use. Override with
   the :option:`sshuttle --method` parameter.
@@ -71,44 +70,23 @@ admin access on the server.
 
 Sudoers File
 ------------
-sshuttle can auto-generate the proper sudoers.d file using the current user
-for Linux and OSX. Doing this will allow sshuttle to run without asking for
-the local sudo password and to give users who do not have sudo access
-ability to run sshuttle::
 
-  sshuttle --sudoers
+sshuttle can generate a sudoers.d file for Linux and MacOS. This
+allows one or more users to run sshuttle without entering the
+local sudo password. **WARNING:** This option is *insecure*
+because, with some cleverness, it also allows these users to run any
+command (via the --ssh-cmd option) as root without a password.
 
-DO NOT run this command with sudo, it will ask for your sudo password when
-it is needed.
-
-A costume user or group can be set with the :
-option:`sshuttle --sudoers --sudoers-username {user_descriptor}` option. Valid
-values for this vary based on how your system is configured. Values such as
-usernames, groups pre-pended with `%` and sudoers user aliases will work. See
-the sudoers manual for more information on valid user specif actions.
-The options must be used with `--sudoers`::
-
-  sshuttle --sudoers --sudoers-user mike
-  sshuttle --sudoers --sudoers-user %sudo
-
-The name of the file to be added to sudoers.d can be configured as well. This
-is mostly not necessary but can be useful for giving more than one user
-access to sshuttle. The default is `sshuttle_auto`::
-
-  sshuttle --sudoer --sudoers-filename sshuttle_auto_mike
-  sshuttle --sudoer --sudoers-filename sshuttle_auto_tommy
-
-You can also see what configuration will be added to your system without
-modifying anything. This can be helpful if the auto feature does not work, or
-you want more control. This option also works with `--sudoers-username`.
-`--sudoers-filename` has no effect with this option::
+To print a sudo configuration file and see a suggested way to install it, run::
 
   sshuttle --sudoers-no-modify
 
-This will simply sprint the generated configuration to STDOUT. Example::
+A custom user or group can be set with the 
+:option:`sshuttle --sudoers-no-modify --sudoers-user {user_descriptor} <sshuttle --sudoers-user>`
+option. Valid values for this vary based on how your system is configured.
+Values such as usernames, groups prepended with `%` and sudoers user 
+aliases will work. See the sudoers manual for more information on valid
+user-specified actions. The option must be used with `--sudoers-no-modify`::
 
-  08:40 PM william$ sshuttle --sudoers-no-modify
-
-  Cmnd_Alias SSHUTTLE304 = /usr/bin/env PYTHONPATH=/usr/local/lib/python2.7/dist-packages/sshuttle-0.78.5.dev30+gba5e6b5.d20180909-py2.7.egg /usr/bin/python /usr/local/bin/sshuttle --method auto --firewall
-
-  william ALL=NOPASSWD: SSHUTTLE304
+  sshuttle --sudoers-no-modify --sudoers-user mike
+  sshuttle --sudoers-no-modify --sudoers-user %sudo

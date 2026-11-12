@@ -16,7 +16,7 @@
 import sys
 import os
 sys.path.insert(0, os.path.abspath('..'))
-import sshuttle.version  # NOQA
+import sshuttle  # NOQA
 
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
@@ -56,7 +56,7 @@ copyright = '2016, Brian May'
 # built documents.
 #
 # The full version, including alpha/beta/rc tags.
-release = sshuttle.version.version
+release = sshuttle.__version__
 # The short X.Y version.
 version = '.'.join(release.split('.')[:2])
 
@@ -103,7 +103,7 @@ pygments_style = 'sphinx'
 
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
-html_theme = 'default'
+html_theme = 'furo'
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the

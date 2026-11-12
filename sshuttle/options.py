@@ -1,5 +1,6 @@
 import re
 import socket
+import sys
 from argparse import ArgumentParser, Action, ArgumentTypeError as Fatal
 
 from sshuttle import __version__
@@ -37,9 +38,9 @@ def parse_subnetport_file(s):
 def parse_subnetport(s):
 
     if s.count(':') > 1:
-        rx = r'(?:\[?([\w\:]+)(?:/(\d+))?]?)(?::(\d+)(?:-(\d+))?)?$'
+        rx = r'(?:\[?(?:\*\.)?([\w\:]+)(?:/(\d+))?]?)(?::(\d+)(?:-(\d+))?)?$'
     else:
-        rx = r'([\w\.\-]+)(?:/(\d+))?(?::(\d+)(?:-(\d+))?)?$'
+        rx = r'((?:\*\.)?[\w\.\-]+)(?:/(\d+))?(?::(\d+)(?:-(\d+))?)?$'
 
     m = re.match(rx, s)
     if not m:
@@ -50,6 +51,15 @@ def parse_subnetport(s):
     #
     # cidr is the mask defined with the slash notation
     host, cidr, fport, lport = m.groups()
+    fport = int(fport or 0)
+    lport = int(lport or fport)
+    for port in (fport, lport):
+        if not 0 <= port <= 65535:
+            raise Fatal('Port %d is not between 0 and 65535' % port)
+    if fport > lport:
+        raise Fatal('Invalid port range %d-%d: first port is greater '
+                    'than last' % (fport, lport))
+
     try:
         addrinfo = socket.getaddrinfo(host, 0, 0, socket.SOCK_STREAM)
     except socket.gaierror:
@@ -91,8 +101,7 @@ def parse_subnetport(s):
                             'not between 0 and %d'
                             % (cidr_to_use, max_cidr))
 
-        rv.append((family, addr[0], cidr_to_use,
-                   int(fport or 0), int(lport or fport or 0)))
+        rv.append((family, addr[0], cidr_to_use, fport, lport))
 
     return rv
 
@@ -116,6 +125,8 @@ def parse_ipport(s):
     host, port = m.groups()
     host = host or '0.0.0.0'
     port = int(port or 0)
+    if not 0 <= port <= 65535:
+        raise Fatal('Port %d is not between 0 and 65535' % port)
 
     try:
         addrinfo = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
@@ -136,6 +147,13 @@ def parse_list(lst):
     return re.split(r'[\s,]+', lst.strip()) if lst else []
 
 
+def parse_namespace(namespace):
+    if not re.fullmatch(
+            r'(@?[a-z_A-Z]\w*(?:\.@?[a-z_A-Z]\w*)*)', namespace):
+        raise Fatal("%r is not a valid namespace name." % namespace)
+    return namespace
+
+
 class Concat(Action):
     def __init__(self, option_strings, dest, nargs=None, **kwargs):
         if nargs is not None:
@@ -147,26 +165,37 @@ class Concat(Action):
         setattr(namespace, self.dest, curr_value + values)
 
 
+# When copying parameters from the command line to a file, some users
+# might copy the quotes they used on the command line into the config
+# file. We ignore these if the text starts and ends with the same quote.
+def strip_quotes(s):
+    if s.startswith("'") and s.endswith("'") or \
+       s.startswith('"') and s.endswith('"'):
+        return s[1:-1]
+    return s
+
+
 # Override one function in the ArgumentParser so that we can have
 # better control for how we parse files containing arguments. We
-# expect one argument per line, but strip whitespace/quotes from the
-# beginning/end of the lines.
+# expect one argument per line, or an option and its value on the same
+# line, but strip whitespace/quotes from the beginning/end of the lines.
 class MyArgumentParser(ArgumentParser):
     def convert_arg_line_to_args(self, arg_line):
-        # Ignore comments
-        if arg_line.startswith("#"):
-            return []
-
         # strip whitespace at beginning and end of line
         arg_line = arg_line.strip()
 
-        # When copying parameters from the command line to a file,
-        # some users might copy the quotes they used on the command
-        # line into the config file. We ignore these if the line
-        # starts and ends with the same quote.
-        if arg_line.startswith("'") and arg_line.endswith("'") or \
-           arg_line.startswith('"') and arg_line.endswith('"'):
-            arg_line = arg_line[1:-1]
+        # Ignore blank lines and comments, including indented ones
+        if not arg_line or arg_line.startswith("#"):
+            return []
+
+        arg_line = strip_quotes(arg_line)
+
+        # Split an option from the value that follows it on the line.
+        # Left whole, argparse reads "-r host" as the value " host" and
+        # doesn't recognize "--remote host" as an option at all.
+        match = re.match(r'(-\w|--\w[\w-]*)\s+(.+)$', arg_line)
+        if match:
+            return [match.group(1), strip_quotes(match.group(2))]
 
         return [arg_line]
 
@@ -215,6 +244,11 @@ parser.add_argument(
     """
 )
 parser.add_argument(
+    "--no-flush-dns",
+    action="store_true",
+    help="do not flush the systemd DNS resolver cache on startup or shutdown"
+)
+parser.add_argument(
     "--ns-hosts",
     metavar="IP[,IP]",
     default=[],
@@ -234,9 +268,14 @@ parser.add_argument(
     """
 )
 
+if sys.platform == 'win32':
+    method_choices = ["auto", "windivert"]
+else:
+    method_choices = ["auto", "nft", "nat", "tproxy", "pf", "ipfw"]
+
 parser.add_argument(
     "--method",
-    choices=["auto", "nat", "nft", "tproxy", "pf", "ipfw"],
+    choices=method_choices,
     metavar="TYPE",
     default="auto",
     help="""
@@ -299,6 +338,22 @@ parser.add_argument(
     default="ssh",
     help="""
     the command to use to connect to the remote [%(default)s]
+    """
+)
+parser.add_argument(
+    "--no-cmd-delimiter",
+    action="store_false",
+    dest="add_cmd_delimiter",
+    help="""
+    do not add a double dash before the python command
+    """
+)
+parser.add_argument(
+    "--remote-shell",
+    metavar="PROGRAM",
+    help="""
+    alternate remote shell program instead of defacto posix shell.
+    For Windows targets it would be either `cmd` or `powershell` unless something like git-bash is in use.
     """
 )
 parser.add_argument(
@@ -383,6 +438,13 @@ parser.add_argument(
     """
 )
 parser.add_argument(
+    "--group",
+    help="""
+    apply all the rules only to this linux group (with the nat method,
+    processes that have this group as a supplementary group also match)
+    """
+)
+parser.add_argument(
     "--firewall",
     action="store_true",
     help="""
@@ -397,17 +459,14 @@ parser.add_argument(
     """
 )
 parser.add_argument(
-    "--sudoers",
-    action="store_true",
-    help="""
-    Add sshuttle to the sudoers for this user
-    """
-)
-parser.add_argument(
     "--sudoers-no-modify",
     action="store_true",
     help="""
-    Prints the sudoers config to STDOUT and DOES NOT modify anything.
+    Prints a sudo configuration to STDOUT which allows a user to
+    run sshuttle without a password. This option is INSECURE because,
+    with some cleverness, it also allows the user to run any command
+    as root without a password. The output also includes a suggested
+    method for you to install the configuration.
     """
 )
 parser.add_argument(
@@ -415,16 +474,7 @@ parser.add_argument(
     default="",
     help="""
     Set the user name or group with %%group_name for passwordless operation.
-    Default is the current user.set ALL for all users. Only works with
-    --sudoers or --sudoers-no-modify option.
-    """
-)
-parser.add_argument(
-    "--sudoers-filename",
-    default="sshuttle_auto",
-    help="""
-    Set the file name for the sudoers.d file to be added. Default is
-    "sshuttle_auto". Only works with --sudoers or --sudoers-no-modify option.
+    Default is the current user. Only works with the --sudoers-no-modify option.
     """
 )
 parser.add_argument(
@@ -444,3 +494,20 @@ parser.add_argument(
     hexadecimal (default '0x01')
     """
 )
+
+if sys.platform == 'linux':
+    net_ns_group = parser.add_mutually_exclusive_group(
+        required=False)
+
+    net_ns_group.add_argument(
+        '--namespace',
+        type=parse_namespace,
+        help="Run inside of a net namespace with the given name."
+    )
+    net_ns_group.add_argument(
+        '--namespace-pid',
+        type=int,
+        help="""
+        Run inside the net namespace used by the process with
+        the given pid."""
+    )

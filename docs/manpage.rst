@@ -102,7 +102,8 @@ Options
     line, ask the server which subnets it thinks we should
     route, and route those automatically.  The suggestions
     are taken automatically from the server's routing
-    table.
+    table. Suggested subnets that fall within a subnet
+    excluded with :option:`-x` are ignored.
 
     This feature does not detect IPv6 routes. Specify IPv6 subnets
     manually. For example, specify the ``::/0`` subnet on the command
@@ -118,6 +119,14 @@ Options
     using the DNS specified via the :option:`--to-ns` option,
     if specified. Only plain DNS traffic sent to these servers
     on port 53 are captured.
+
+.. option:: --no-flush-dns
+
+    Skip flushing the systemd DNS resolver cache at startup and shutdown.
+    By default, sshuttle flushes this cache on Linux so cached responses
+    do not bypass DNS forwarding. Use this option when managing the cache
+    yourself or when systemd-resolved is unavailable. Cached DNS answers
+    may remain until they expire or are flushed manually.
 
 .. option:: --ns-hosts=<server1[,server2[,server3[...]]]>
 
@@ -181,6 +190,18 @@ Options
     in a non-standard location or you want to provide extra
     options to the ssh command, for example, ``-e 'ssh -v'``.
 
+.. option:: --remote-shell
+
+    For Windows targets, specify configured remote shell program alternative to defacto posix shell.
+    It would be either ``cmd`` or ``powershell`` unless something like git-bash is in use.
+
+.. option:: --no-cmd-delimiter
+
+    Do not add a double dash (--) delimiter before invoking Python on
+    the remote host. This option is useful when the ssh command used
+    to connect is a custom command that does not interpret this
+    delimiter correctly.
+
 .. option:: --seed-hosts
 
     A comma-separated list of hostnames to use to
@@ -218,6 +239,11 @@ Options
     to be made between latency and bandwidth without completely
     disabling latency control (with :option:`--no-latency-control`).
 
+.. option:: --wrap=<num>
+
+    Restart counting channel numbers after *num*. This option is
+    only meant for testing.
+
 .. option:: -D, --daemon
 
     Automatically fork into the background after connecting
@@ -242,8 +268,19 @@ Options
 
 .. option:: --disable-ipv6
 
-    Disable IPv6 support for methods that support it (nft, tproxy, and
-    pf).
+    Disable IPv6 support for methods that support it (nat, nft,
+    tproxy, and pf).
+
+.. option:: --user=<user>
+
+    Apply all the rules only to this linux user. Only supported by
+    the nat method.
+
+.. option:: --group=<group>
+
+    Apply all the rules only to this linux group. Processes that have
+    this group as a supplementary group also match. Only supported by
+    the nat method.
 
 .. option:: --firewall
 
@@ -262,35 +299,47 @@ Options
     makes it a lot easier to debug and test the :option:`--auto-hosts`
     feature.
 
-.. option:: --sudoers
-
-    sshuttle will auto generate the proper sudoers.d config file and add it.
-    Once this is completed, sshuttle will exit and tell the user if
-    it succeed or not. Do not call this options with sudo, it may generate a
-    incorrect config file.
-
 .. option:: --sudoers-no-modify
 
-    sshuttle will auto generate the proper sudoers.d config and print it to
-    stdout. The option will not modify the system at all.
+    sshuttle prints a configuration to stdout which allows a user to
+    run sshuttle without a password. This option is INSECURE because,
+    with some cleverness, it also allows the user to run any command
+    as root without a password. The output also includes a suggested
+    method for you to install the configuration.
+
+    Use --sudoers-user to modify the user that it applies to.
 
 .. option:: --sudoers-user
 
-    Set the user name or group with %group_name for passwordless operation.
-    Default is the current user.set ALL for all users. Only works with
-    --sudoers or --sudoers-no-modify option.
+    Set the user name or group with %group_name for passwordless
+    operation. Default is the current user. Set to ALL for all users
+    (NOT RECOMMENDED: See note about security in --sudoers-no-modify
+    documentation above). Only works with the --sudoers-no-modify
+    option.
 
-.. option:: --sudoers-filename
+.. option:: --no-sudo-pythonpath
 
-    Set the file name for the sudoers.d file to be added. Default is
-    "sshuttle_auto". Only works with --sudoers.
+    Do not set PYTHONPATH when invoking sudo (or doas) to start the
+    firewall manager. By default, it is set to the directory that
+    contains the :program:`sshuttle` package.
 
 .. option:: -t <mark>, --tmark=<mark>
 
     An option used by the tproxy method: Use the specified traffic
     mark. The mark must be a hexadecimal value. Defaults to 0x01.
 
-.. option:: --version
+.. option:: --namespace=<name>
+
+    (Linux only) Run inside of the net namespace with the given name,
+    as found in /var/run/netns. Cannot be combined with
+    :option:`--namespace-pid`.
+
+.. option:: --namespace-pid=<pid>
+
+    (Linux only) Run inside the net namespace used by the process
+    with the given pid. Cannot be combined with :option:`--namespace`.
+
+.. option:: -V, --version
 
     Print program version.
 
@@ -317,6 +366,12 @@ Arguments read from a file must be one per line, as shown below::
     --option2
     value2
 
+An option and its value can also share a line, as they would on the
+command line::
+
+    --option1 value1
+    -r user@example.com
+
 The configuration file supports comments for human-readable
 annotations. For example::
 
@@ -326,6 +381,18 @@ annotations. For example::
     192.168.63.0/24
 
 
+Environment Variable
+--------------------
+
+You can specify command line options with the `SSHUTTLE_ARGS` environment
+variable. If a given option is defined in both the environment variable and
+command line, the value on the command line will take precedence.
+
+For example::
+
+    SSHUTTLE_ARGS="-e 'ssh -v' --dns" sshuttle -r example.com 0/0
+
+
 Examples
 --------
 
@@ -333,15 +400,14 @@ Use the following command to route all IPv4 TCP traffic through remote
 (-r) host example.com (and possibly other traffic too, depending on
 the selected --method). The 0/0 subnet, short for 0.0.0.0/0, matches
 all IPv4 addresses. The ::/0 subnet, matching all IPv6 addresses could
-be added to the example. We also exclude (-x) example.com:22 so that
-we can establish ssh connections from our local machine to the remote
-host without them being routed through sshuttle. Excluding the remote
-host may be necessary on some machines for sshuttle to work properly.
-Press Ctrl+C to exit. To also route DNS queries through sshuttle, try
-adding --dns. Add or remove -v options to see more or less
-information::
+be added to the example. The SSH connection endpoint is automatically
+excluded from forwarding. When `ProxyCommand` is configured,
+automatic exclusion is skipped; use :option:`-x` to exclude the
+required address manually. Press Ctrl+C to exit. To also route DNS
+queries through sshuttle, try adding --dns. Add or remove -v options
+to see more or less information::
 
-    $ sshuttle -r example.com -x example.com:22 0/0
+    $ sshuttle -r example.com 0/0
 
     Starting sshuttle proxy (version ...).
     [local sudo] Password:
@@ -357,8 +423,8 @@ information::
     c : Subnets to forward through remote host (type, IP, cidr mask width, startPort, endPort):
     c :   (<AddressFamily.AF_INET: 2>, '0.0.0.0', 0, 0, 0)
     c : Subnets to exclude from forwarding:
-    c :   (<AddressFamily.AF_INET: 2>, '...', 32, 22, 22)
     c :   (<AddressFamily.AF_INET: 2>, '127.0.0.1', 32, 0, 0)
+    c :   (<AddressFamily.AF_INET: 2>, '...', 32, 0, 0)
     c : TCP redirector listening on ('127.0.0.1', 12299).
     c : Starting client with Python version 3.9.5
     c : Connecting to server...
@@ -381,7 +447,7 @@ information::
 Connect to a remote server, with automatic hostname
 and subnet guessing::
 
-    $ sshuttle -vNHr example.com -x example.com:22
+    $ sshuttle -vNHr example.com
     Starting sshuttle proxy (version ...).
     [local sudo] Password:
     fw: Starting firewall with Python version 3.9.5
@@ -396,8 +462,8 @@ and subnet guessing::
     c : Subnets to forward through remote host (type, IP, cidr mask width, startPort, endPort):
     c : NOTE: Additional subnets to forward may be added below by --auto-nets.
     c : Subnets to exclude from forwarding:
-    c :   (<AddressFamily.AF_INET: 2>, '...', 32, 22, 22)
     c :   (<AddressFamily.AF_INET: 2>, '127.0.0.1', 32, 0, 0)
+    c :   (<AddressFamily.AF_INET: 2>, '...', 32, 0, 0)
     c : TCP redirector listening on ('127.0.0.1', 12300).
     c : Starting client with Python version 3.9.5
     c : Connecting to server...
@@ -460,7 +526,7 @@ Packet-level forwarding (eg. using the tun/tap devices on
 Linux) seems elegant at first, but it results in
 several problems, notably the 'tcp over tcp' problem.  The
 tcp protocol depends fundamentally on packets being dropped
-in order to implement its congestion control agorithm; if
+in order to implement its congestion control algorithm; if
 you pass tcp packets through a tcp-based tunnel (such as
 ssh), the inner tcp packets will never be dropped, and so
 the inner tcp stream's congestion control will be

@@ -13,7 +13,7 @@ class Method(BaseMethod):
     # recently-started one will win (because we use "-I OUTPUT 1" instead of
     # "-A OUTPUT").
     def setup_firewall(self, port, dnsport, nslist, family, subnets, udp,
-                       user, tmark):
+                       user, group, tmark):
         if udp:
             raise Exception("UDP not supported by nft")
 
@@ -56,6 +56,9 @@ class Method(BaseMethod):
         # Redirect DNS traffic as requested. This includes routing traffic
         # to localhost DNS servers through sshuttle.
         for _, ip in [i for i in nslist if i[0] == family]:
+            # A link-local nameserver carries a zone id (fe80::1%eth0),
+            # which nft does not accept in an address match.
+            ip = ip.split('%', 1)[0]
             _nft('add rule', chain, ip_version,
                  'daddr %s' % ip, 'udp dport 53',
                  ('redirect to :' + str(dnsport)))
@@ -87,7 +90,7 @@ class Method(BaseMethod):
                     ip_version, 'daddr %s/%s' % (snet, swidth),
                     ('redirect to :' + str(port)))))
 
-    def restore_firewall(self, port, family, udp, user):
+    def restore_firewall(self, port, family, udp, user, group):
         if udp:
             raise Exception("UDP not supported by nft method_name")
 

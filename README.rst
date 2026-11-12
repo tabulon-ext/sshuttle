@@ -4,7 +4,7 @@ sshuttle: where transparent proxy meets VPN meets ssh
 As far as I know, sshuttle is the only program that solves the following
 common case:
 
-- Your client machine (or router) is Linux, FreeBSD, or MacOS.
+- Your client machine (or router) is Linux, FreeBSD, MacOS, or `Windows <https://sshuttle.readthedocs.io/en/stable/windows.html>`_ (experimental).
 
 - You have access to a remote network via ssh.
 
@@ -30,80 +30,9 @@ common case:
 Obtaining sshuttle
 ------------------
 
-- Ubuntu 16.04 or later::
+Please see the documentation_.
 
-      apt-get install sshuttle
-
-- Debian stretch or later::
-
-      apt-get install sshuttle
-
-- Arch Linux::
-
-      pacman -S sshuttle
-
-- Fedora::
-
-      dnf install sshuttle
-
-- openSUSE::
-
-      zypper in sshuttle
-
-- Gentoo::
-
-      emerge -av net-proxy/sshuttle
-
-- NixOS::
-
-      nix-env -iA nixos.sshuttle
-
-- From PyPI::
-
-      sudo pip install sshuttle
-
-- Clone::
-
-      git clone https://github.com/sshuttle/sshuttle.git
-      cd sshuttle
-      sudo ./setup.py install
-
-- FreeBSD::
-
-      # ports
-      cd /usr/ports/net/py-sshuttle && make install clean
-      # pkg
-      pkg install py36-sshuttle
-
-- macOS, via MacPorts::
-
-      sudo port selfupdate
-      sudo port install sshuttle
-
-It is also possible to install into a virtualenv as a non-root user.
-
-- From PyPI::
-
-      virtualenv -p python3 /tmp/sshuttle
-      . /tmp/sshuttle/bin/activate
-      pip install sshuttle
-
-- Clone::
-
-      virtualenv -p python3 /tmp/sshuttle
-      . /tmp/sshuttle/bin/activate
-      git clone https://github.com/sshuttle/sshuttle.git
-      cd sshuttle
-      ./setup.py install
-
-- Homebrew::
-
-      brew install sshuttle
-
-- Nix::
-
-      nix-env -iA nixpkgs.sshuttle
-
+.. _Documentation: https://sshuttle.readthedocs.io/en/stable/installation.html
 
 Documentation
 -------------

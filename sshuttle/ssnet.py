@@ -1,14 +1,85 @@
 import sys
 import struct
+import queue
 import socket
+import threading
 import errno
 import select
 import os
-import fcntl
 
-from sshuttle.helpers import b, log, debug1, debug2, debug3, Fatal
+from sshuttle.helpers import b, log, debug1, debug2, debug3, Fatal, set_non_blocking_io
 
 MAX_CHANNEL = 65535
+
+# Number of helper threads used to close finished sockets.
+#
+# close() on a socket is normally instant, but it can block in the kernel for
+# many seconds on hosts where a socket-filter network extension inspects flow
+# teardown (observed on macOS with third-party endpoint-security and VPN
+# clients installed: individual close() calls blocking 9-12 seconds with the
+# process at 0% CPU).
+#
+# sshuttle's event loop is single threaded, so one blocking close() stalls
+# every other connection in the tunnel, not just the one being closed. The
+# symptom is severe: requests that normally take 0.2s intermittently take
+# 5-15s, and unrelated connections stall together in bursts because they are
+# all queued behind the same close().
+#
+# Closing on helper threads keeps the event loop responsive. The threads only
+# ever sleep in close(), so the pool size just sets how fast a backlog drains:
+# CLOSERS/latency closes per second.
+CLOSERS = 4
+
+# Cap on the number of finished sockets waiting to be closed. Each one holds
+# its fd open until a helper gets to it, so an unbounded queue trades a stalled
+# event loop for fd exhaustion under sustained churn that outruns the closers.
+# Past this many, close_later() closes inline instead: at that point the
+# backlog is pathological and stalling is the lesser failure.
+MAX_CLOSE_BACKLOG = 512
+
+_close_q = None
+
+
+def close_later(sock):
+    """Close a finished socket without blocking the event loop.
+
+    Only call this for sockets whose handler has already been dropped from
+    the poll set, so nothing will touch them again. The socket object (not
+    the fd) is queued, which keeps it referenced until the helper closes it,
+    so the interpreter cannot close the same fd twice.
+
+    If closes run slower than connection churn, the finished sockets pile up
+    in the queue and hold their fds open until a helper gets to them. The
+    queue is capped at MAX_CLOSE_BACKLOG for that reason; beyond it we close
+    inline and take the stall, rather than run the process out of fds.
+    """
+    global _close_q
+    if sock is None:
+        return
+    if _close_q is None:
+        _close_q = queue.Queue(maxsize=MAX_CLOSE_BACKLOG)
+
+        def closer():
+            while True:
+                sock = _close_q.get()
+                try:
+                    sock.close()
+                except Exception as e:
+                    debug1('error closing %r: %s' % (sock, e))
+
+        for i in range(CLOSERS):
+            threading.Thread(target=closer, name='sshuttle-closer-%d' % i,
+                             daemon=True).start()
+    try:
+        _close_q.put_nowait(sock)
+    except queue.Full:
+        debug1('close backlog full (%d); closing inline' % MAX_CLOSE_BACKLOG)
+        try:
+            sock.close()
+        except Exception as e:
+            debug1('error closing %r: %s' % (sock, e))
+
+
 LATENCY_BUFFER_SIZE = 32768
 
 SHUT_RD = 0
@@ -64,27 +135,64 @@ def _add(socks, elem):
         socks.append(elem)
 
 
+def _fd(sock):
+    try:
+        return sock.fileno()
+    except AttributeError:
+        return sock
+
+
 def _fds(socks):
-    out = []
-    for i in socks:
-        try:
-            out.append(i.fileno())
-        except AttributeError:
-            out.append(i)
-    out.sort()
-    return out
+    return sorted(_fd(i) for i in socks)
+
+
+def _select(r, w, x, timeout=None):
+    """select.select() for descriptors of any number.
+
+    select() cannot watch a descriptor numbered FD_SETSIZE (1024) or more,
+    whatever the open file limit is. When it refuses, use poll() instead.
+    """
+    try:
+        return select.select(r, w, x, timeout)
+    except ValueError:
+        if not hasattr(select, 'poll'):  # Windows
+            raise
+    masks = {}
+    for socks, mask in ((r, select.POLLIN), (w, select.POLLOUT),
+                        (x, select.POLLPRI)):
+        for s in socks:
+            fd = _fd(s)
+            masks[fd] = masks.get(fd, 0) | mask
+    poller = select.poll()
+    for fd, mask in masks.items():
+        poller.register(fd, mask)
+    events = dict(poller.poll(None if timeout is None else timeout * 1000))
+    if any(ev & select.POLLNVAL for ev in events.values()):
+        raise OSError(errno.EBADF, os.strerror(errno.EBADF))
+    # poll() reports errors and hangups whether asked to or not; select()
+    # reports them as readable and writable, and so must we, or the caller
+    # would be woken up forever without being told why.
+    bad = select.POLLERR | select.POLLHUP
+
+    def ready(socks, mask):
+        return [s for s in socks if events.get(_fd(s), 0) & mask]
+    return (ready(r, select.POLLIN | bad), ready(w, select.POLLOUT | bad),
+            ready(x, select.POLLPRI))
 
 
 def _nb_clean(func, *args):
     try:
         return func(*args)
-    except OSError:
+    except (OSError, socket.error):
+        # Note: In python2 socket.error != OSError (In python3, they are same)
         _, e = sys.exc_info()[:2]
-        if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
-            raise
-        else:
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
             debug3('%s: err was: %s' % (func.__name__, e))
             return None
+        else:
+            # Re-raise other errors (including EPIPE) so they can be handled
+            # by the calling function appropriately
+            raise
 
 
 def _try_peername(sock):
@@ -107,6 +215,16 @@ _swcount = 0
 
 
 class SockWrapper:
+
+    def dispose(self):
+        """Hand our sockets to the closer pool.
+
+        Only called once the wrapper's handler has been dropped from the
+        poll set, so nothing will touch them again.
+        """
+        close_later(self.rsock)
+        if self.wsock is not self.rsock:
+            close_later(self.wsock)
 
     def __init__(self, rsock, wsock, connect_to=None, peername=None):
         global _swcount
@@ -168,19 +286,25 @@ class SockWrapper:
                 debug3('%r: fixed connect result: %s' % (self, e))
             if e.args[0] in [errno.EINPROGRESS, errno.EALREADY]:
                 pass  # not connected yet
+            elif sys.platform == 'win32' and e.args[0] == errno.WSAEWOULDBLOCK:  # 10035
+                pass  # not connected yet
             elif e.args[0] == 0:
-                # connected successfully (weird Linux bug?)
-                # Sometimes Linux seems to return EINVAL when it isn't
-                # invalid.  This *may* be caused by a race condition
-                # between connect() and getsockopt(SO_ERROR) (ie. it
-                # finishes connecting in between the two, so there is no
-                # longer an error).  However, I'm not sure of that.
-                #
-                # I did get at least one report that the problem went away
-                # when we added this, however.
-                self.connect_to = None
+                if sys.platform == 'win32':
+                    # On Windows "real" error of EINVAL could be 0, when socket is in connecting state
+                    pass
+                else:
+                    # connected successfully (weird Linux bug?)
+                    # Sometimes Linux seems to return EINVAL when it isn't
+                    # invalid.  This *may* be caused by a race condition
+                    # between connect() and getsockopt(SO_ERROR) (ie. it
+                    # finishes connecting in between the two, so there is no
+                    # longer an error).  However, I'm not sure of that.
+                    #
+                    # I did get at least one report that the problem went away
+                    # when we added this, however.
+                    self.connect_to = None
             elif e.args[0] == errno.EISCONN:
-                # connected successfully (BSD)
+                # connected successfully (BSD + Windows)
                 self.connect_to = None
             elif e.args[0] in NET_ERRS + [errno.EACCES, errno.EPERM]:
                 # a "normal" kind of error
@@ -193,7 +317,6 @@ class SockWrapper:
         if not self.shut_read:
             debug2('%r: done reading' % self)
             self.shut_read = True
-            # self.rsock.shutdown(SHUT_RD)  # doesn't do anything anyway
 
     def nowrite(self):
         if not self.shut_write:
@@ -214,8 +337,8 @@ class SockWrapper:
             return 0  # still connecting
         self.wsock.setblocking(False)
         try:
-            return _nb_clean(os.write, self.wsock.fileno(), buf)
-        except OSError:
+            return _nb_clean(self.wsock.send, buf)
+        except (OSError, socket.error):
             _, e = sys.exc_info()[:2]
             if e.errno == errno.EPIPE:
                 debug1('%r: uwrite: got EPIPE' % self)
@@ -227,7 +350,7 @@ class SockWrapper:
                 return 0
 
     def write(self, buf):
-        assert(buf)
+        assert buf
         return self.uwrite(buf)
 
     def uread(self):
@@ -237,11 +360,16 @@ class SockWrapper:
             return
         self.rsock.setblocking(False)
         try:
-            return _nb_clean(os.read, self.rsock.fileno(), 65536)
-        except OSError:
+            return _nb_clean(self.rsock.recv, 65536)
+        except (OSError, socket.error):
             _, e = sys.exc_info()[:2]
-            self.seterr('uread: %s' % e)
-            return b('')  # unexpected error... we'll call it EOF
+            if e.errno == errno.EPIPE:
+                debug1('%r: uread: got EPIPE' % self)
+                self.noread()
+                return b('')  # treat broken pipe as EOF
+            else:
+                self.seterr('uread: %s' % e)
+                return b('')  # unexpected error... we'll call it EOF
 
     def fill(self):
         if self.buf:
@@ -264,6 +392,9 @@ class SockWrapper:
 
 class Handler:
 
+    def dispose(self):
+        pass
+
     def __init__(self, socks=None, callback=None):
         self.ok = True
         self.socks = socks or []
@@ -276,7 +407,7 @@ class Handler:
 
     def callback(self, sock):
         log('--no callback defined-- %r' % self)
-        (r, _, _) = select.select(self.socks, [], [], 0)
+        (r, _, _) = _select(self.socks, [], [], 0)
         for s in r:
             v = s.recv(4096)
             if not v:
@@ -286,6 +417,10 @@ class Handler:
 
 
 class Proxy(Handler):
+
+    def dispose(self):
+        self.wrap1.dispose()
+        self.wrap2.dispose()
 
     def __init__(self, wrap1, wrap2):
         Handler.__init__(self, [wrap1.rsock, wrap1.wsock,
@@ -373,11 +508,6 @@ class Mux(Handler):
             if not self.too_full:
                 self.send(0, CMD_PING, b('rttest'))
             self.too_full = True
-        # ob = []
-        # for b in self.outbuf:
-        #    (s1,s2,c) = struct.unpack('!ccH', b[:4])
-        #    ob.append(c)
-        # log('outbuf: %d %r' % (self.amount_queued(), ob))
 
     def send(self, channel, cmd, data):
         assert isinstance(data, bytes)
@@ -388,11 +518,13 @@ class Mux(Handler):
         debug2(' > channel=%d cmd=%s len=%d (fullness=%d)'
                % (channel, cmd_to_name.get(cmd, hex(cmd)),
                   len(data), self.fullness))
+        # debug3('>>> data: %r' % data)
         self.fullness += len(data)
 
     def got_packet(self, channel, cmd, data):
         debug2('<  channel=%d cmd=%s len=%d'
                % (channel, cmd_to_name.get(cmd, hex(cmd)), len(data)))
+        # debug3('<<< data: %r' % data)
         if cmd == CMD_PING:
             self.send(0, CMD_PONG, data)
         elif cmd == CMD_PONG:
@@ -402,15 +534,15 @@ class Mux(Handler):
         elif cmd == CMD_EXIT:
             self.ok = False
         elif cmd == CMD_TCP_CONNECT:
-            assert(not self.channels.get(channel))
+            assert not self.channels.get(channel)
             if self.new_channel:
                 self.new_channel(channel, data)
         elif cmd == CMD_DNS_REQ:
-            assert(not self.channels.get(channel))
+            assert not self.channels.get(channel)
             if self.got_dns_req:
                 self.got_dns_req(channel, data)
         elif cmd == CMD_UDP_OPEN:
-            assert(not self.channels.get(channel))
+            assert not self.channels.get(channel)
             if self.got_udp_open:
                 self.got_udp_open(channel, data)
         elif cmd == CMD_ROUTES:
@@ -437,15 +569,10 @@ class Mux(Handler):
                 callback(cmd, data)
 
     def flush(self):
-        try:
-            os.set_blocking(self.wfile.fileno(), False)
-        except AttributeError:
-            # python < 3.5
-            flags = fcntl.fcntl(self.wfile.fileno(), fcntl.F_GETFL)
-            flags |= os.O_NONBLOCK
-            flags = fcntl.fcntl(self.wfile.fileno(), fcntl.F_SETFL, flags)
+        set_non_blocking_io(self.wfile.fileno())
         if self.outbuf and self.outbuf[0]:
-            wrote = _nb_clean(os.write, self.wfile.fileno(), self.outbuf[0])
+            wrote = _nb_clean(self.wfile.write, self.outbuf[0])
+            # self.wfile.flush()
             debug2('mux wrote: %r/%d' % (wrote, len(self.outbuf[0])))
             if wrote:
                 self.outbuf[0] = self.outbuf[0][wrote:]
@@ -453,18 +580,12 @@ class Mux(Handler):
             self.outbuf[0:1] = []
 
     def fill(self):
-        try:
-            os.set_blocking(self.rfile.fileno(), False)
-        except AttributeError:
-            # python < 3.5
-            flags = fcntl.fcntl(self.rfile.fileno(), fcntl.F_GETFL)
-            flags |= os.O_NONBLOCK
-            flags = fcntl.fcntl(self.rfile.fileno(), fcntl.F_SETFL, flags)
+        set_non_blocking_io(self.rfile.fileno())
         try:
             # If LATENCY_BUFFER_SIZE is inappropriately large, we will
             # get a MemoryError here. Read no more than 1MiB.
-            read = _nb_clean(os.read, self.rfile.fileno(),
-                             min(1048576, LATENCY_BUFFER_SIZE))
+            read = _nb_clean(self.rfile.read, min(1048576, LATENCY_BUFFER_SIZE))
+            debug2('mux read: %r' % len(read))
         except OSError:
             _, e = sys.exc_info()[:2]
             raise Fatal('other end: %r' % e)
@@ -476,14 +597,12 @@ class Mux(Handler):
 
     def handle(self):
         self.fill()
-        # log('inbuf is: (%d,%d) %r'
-        #     % (self.want, len(self.inbuf), self.inbuf))
         while 1:
             if len(self.inbuf) >= (self.want or HDR_LEN):
                 (s1, s2, channel, cmd, datalen) = \
                     struct.unpack('!ccHHH', self.inbuf[:HDR_LEN])
-                assert(s1 == b('S'))
-                assert(s2 == b('S'))
+                assert s1 == b('S')
+                assert s2 == b('S')
                 self.want = datalen + HDR_LEN
             if self.want and len(self.inbuf) >= self.want:
                 data = self.inbuf[HDR_LEN:self.want]
@@ -499,7 +618,7 @@ class Mux(Handler):
             _add(w, self.wfile)
 
     def callback(self, sock):
-        (r, w, _) = select.select([self.rfile], [self.wfile], [], 0)
+        (r, w, _) = _select([self.rfile], [self.wfile], [], 0)
         if self.rfile in r:
             self.handle()
         if self.outbuf and self.wfile in w:
@@ -507,6 +626,11 @@ class Mux(Handler):
 
 
 class MuxWrapper(SockWrapper):
+
+    def dispose(self):
+        # Our rsock/wsock are the mux's own stdin/stdout, shared by every
+        # channel; the mux owns them and they must outlive us.
+        pass
 
     def __init__(self, mux, channel):
         SockWrapper.__init__(self, mux.rfile, mux.wfile)
@@ -599,13 +723,14 @@ def runonce(handlers, mux):
     to_remove = [s for s in handlers if not s.ok]
     for h in to_remove:
         handlers.remove(h)
+        h.dispose()
 
     for s in handlers:
         s.pre_select(r, w, x)
     debug2('Waiting: %d r=%r w=%r x=%r (fullness=%d/%d)'
            % (len(handlers), _fds(r), _fds(w), _fds(x),
                mux.fullness, mux.too_full))
-    (r, w, x) = select.select(r, w, x)
+    (r, w, x) = _select(r, w, x)
     debug2('  Ready: %d r=%r w=%r x=%r'
            % (len(handlers), _fds(r), _fds(w), _fds(x)))
     ready = r + w + x

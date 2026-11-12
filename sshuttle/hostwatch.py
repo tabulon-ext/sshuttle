@@ -18,6 +18,8 @@ CACHEFILE = os.path.expanduser('~/.sshuttle.hosts')
 # Have we already failed to write CACHEFILE?
 CACHE_WRITE_FAILED = False
 
+SHOULD_WRITE_CACHE = False
+
 hostnames = {}
 queue = {}
 try:
@@ -55,7 +57,7 @@ def write_host_cache():
 
         try:
             os.unlink(tmpname)
-        except BaseException:
+        except Exception:
             pass
 
 
@@ -81,6 +83,11 @@ def read_host_cache():
             ip = re.sub(r'[^0-9.]', '', ip).strip()
             if name and ip:
                 found_host(name, ip)
+    f.close()
+    global SHOULD_WRITE_CACHE
+    if SHOULD_WRITE_CACHE:
+        write_host_cache()
+        SHOULD_WRITE_CACHE = False
 
 
 def found_host(name, ip):
@@ -88,8 +95,9 @@ def found_host(name, ip):
        hostnames list, send the host to the sshuttle client via
        stdout, and write the host to the cache file.
     """
+    if not re.match(r'^[-\w\.]+$', name):
+        return
     hostname = re.sub(r'\..*', '', name)
-    hostname = re.sub(r'[^-\w\.]', '_', hostname)
     if (ip.startswith('127.') or ip.startswith('255.') or
             hostname == 'localhost'):
         return
@@ -97,12 +105,13 @@ def found_host(name, ip):
     if hostname != name:
         found_host(hostname, ip)
 
+    global SHOULD_WRITE_CACHE
     oldip = hostnames.get(name)
     if oldip != ip:
         hostnames[name] = ip
         debug1('Found: %s: %s' % (name, ip))
         sys.stdout.write('%s,%s\n' % (name, ip))
-        write_host_cache()
+        SHOULD_WRITE_CACHE = True
 
 
 def _check_etc_hosts():

@@ -6,7 +6,7 @@ Client side Requirements
 
 - sudo, or root access on your client machine.
   (The server doesn't need admin access.)
-- Python 3.6 or greater.
+- Python 3.10 or greater.
 
 
 Linux with NAT method
@@ -65,14 +65,13 @@ Requires:
 Windows
 ~~~~~~~
 
-Not officially supported, however can be made to work with Vagrant. Requires
-cmd.exe with Administrator access. See :doc:`windows` for more information.
+Experimental built-in support available. See :doc:`windows` for more information.
 
 
 Server side Requirements
 ------------------------
 
-- Python 3.6 or greater.
+- Python 3.10 or greater.
 
 
 Additional Suggested Software

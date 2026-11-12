@@ -1,3 +1,4 @@
+import errno
 import re
 import struct
 import socket
@@ -5,15 +6,22 @@ import traceback
 import time
 import sys
 import os
+import io
 
 
 import sshuttle.ssnet as ssnet
 import sshuttle.helpers as helpers
 import sshuttle.hostwatch as hostwatch
 import subprocess as ssubprocess
-from sshuttle.ssnet import Handler, Proxy, Mux, MuxWrapper
+from sshuttle.ssnet import Handler, Proxy, Mux, MuxWrapper, \
+    close_later
 from sshuttle.helpers import b, log, debug1, debug2, debug3, Fatal, \
-    resolvconf_random_nameserver, which, get_env
+    get_random_nameserver, which, get_env, SocketRWShim
+
+
+# What socket() fails with when the process (EMFILE) or the whole system
+# (ENFILE) has no file descriptor left.
+OUT_OF_FILES = (errno.EMFILE, errno.ENFILE)
 
 
 def _ipmatch(ipstr):
@@ -34,7 +42,6 @@ def _ipmatch(ipstr):
         elif g[3] is None:
             ips += '.0'
             width = min(width, 24)
-        ips = ips
         return (struct.unpack('!I', socket.inet_aton(ips))[0], width)
 
 
@@ -79,6 +86,21 @@ def _route_iproute(line):
     return ipw, int(mask)
 
 
+def _route_windows(line):
+    parts = re.split(r'\s+', line.strip())
+    if len(parts) < 4:
+        return None, None
+    prefix = parts[3]
+    dest, mask = prefix.split('/')
+    if mask == "32":
+        return None, None
+    for p in ('127.', '0.', '224.', '169.254.'):
+        if dest.startswith(p):
+            return None, None
+    ipw = _ipmatch(dest)
+    return ipw, int(mask)
+
+
 def _list_routes(argv, extract_route):
     # FIXME: IPv4 only
     p = ssubprocess.Popen(argv, stdout=ssubprocess.PIPE, env=get_env())
@@ -86,7 +108,7 @@ def _list_routes(argv, extract_route):
     for line in p.stdout:
         if not line.strip():
             continue
-        ipw, mask = extract_route(line.decode("ASCII"))
+        ipw, mask = extract_route(line.decode("ASCII", errors='ignore'))
         if not ipw:
             continue
         width = min(ipw[1], mask)
@@ -101,14 +123,17 @@ def _list_routes(argv, extract_route):
 
 
 def list_routes():
-    if which('ip'):
-        routes = _list_routes(['ip', 'route'], _route_iproute)
-    elif which('netstat'):
-        routes = _list_routes(['netstat', '-rn'], _route_netstat)
+    if sys.platform == 'win32':
+        routes = _list_routes(['netsh', 'interface', 'ipv4', 'show', 'route'], _route_windows)
     else:
-        log('WARNING: Neither "ip" nor "netstat" were found on the server. '
-            '--auto-nets feature will not work.')
-        routes = []
+        if which('ip'):
+            routes = _list_routes(['ip', 'route'], _route_iproute)
+        elif which('netstat'):
+            routes = _list_routes(['netstat', '-rn'], _route_netstat)
+        else:
+            log('WARNING: Neither "ip" nor "netstat" were found on the server. '
+                '--auto-nets feature will not work.')
+            routes = []
 
     for (family, ip, width) in routes:
         if not ip.startswith('0.') and not ip.startswith('127.'):
@@ -121,6 +146,11 @@ def _exc_dump():
 
 
 def start_hostwatch(seed_hosts, auto_hosts):
+    if not hasattr(os, 'fork'):
+        # hostwatch runs in a forked child, which Windows does not have.
+        log('WARNING: os.fork is not available on the server. '
+            '--auto-hosts and --seed-hosts features will not work.')
+        return None
     s1, s2 = socket.socketpair()
     pid = os.fork()
     if not pid:
@@ -150,6 +180,12 @@ class Hostwatch:
 
 
 class DnsProxy(Handler):
+
+    def dispose(self):
+        # self.peers holds every socket we made, including ones whose send()
+        # failed and so never reached self.socks.
+        for sock in self.peers:
+            close_later(sock)
 
     def __init__(self, mux, chan, request, to_nameserver):
         Handler.__init__(self, [])
@@ -182,20 +218,29 @@ class DnsProxy(Handler):
         self.tries += 1
 
         if self.to_nameserver is None:
-            _, peer = resolvconf_random_nameserver(False)
+            _, peer = get_random_nameserver()
             port = 53
         else:
             peer = self.to_ns_peer
             port = int(self.to_ns_port)
 
-        family, sockaddr = self._addrinfo(peer, port)
-        sock = socket.socket(family, socket.SOCK_DGRAM)
-        sock.connect(sockaddr)
+        try:
+            # getaddrinfo() needs a descriptor too
+            family, sockaddr = self._addrinfo(peer, port)
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+        except OSError as e:
+            if e.errno not in OUT_OF_FILES:
+                raise
+            log('warning: too many open files.  Discarded DNS request.')
+            return
 
         self.peers[sock] = peer
 
         debug2('DNS: sending to %r:%d (try %d)' % (peer, port, self.tries))
         try:
+            # connect() already fails if there is no route to the
+            # nameserver, e.g. an IPv6 one on a host without IPv6.
+            sock.connect(sockaddr)
             sock.send(self.request)
             self.socks.append(sock)
         except socket.error:
@@ -237,6 +282,9 @@ class DnsProxy(Handler):
 
 
 class UdpProxy(Handler):
+
+    def dispose(self):
+        close_later(self.sock)
 
     def __init__(self, mux, chan, family):
         sock = socket.socket(family, socket.SOCK_DGRAM)
@@ -282,7 +330,16 @@ def main(latency_control, latency_buffer_size, auto_hosts, to_nameserver,
         sys.stdout.flush()
 
         handlers = []
-        mux = Mux(sys.stdin, sys.stdout)
+        # get unbuffered stdin and stdout in binary mode. Equivalent to stdin.buffer/stdout.buffer (Only available in Python 3)
+        r, w = io.FileIO(0, mode='r'), io.FileIO(1, mode='w')
+        if sys.platform == 'win32':
+            def _deferred_exit():
+                time.sleep(1)  # give enough time to write logs to stderr
+                os._exit(23)
+            shim = SocketRWShim(r, w, on_end=_deferred_exit)
+            mux = Mux(*shim.makefiles())
+        else:
+            mux = Mux(r, w)
         handlers.append(mux)
 
         debug1('auto-nets:' + str(auto_nets))
@@ -303,7 +360,7 @@ def main(latency_control, latency_buffer_size, auto_hosts, to_nameserver,
         hw.leftover = b('')
 
         def hostwatch_ready(sock):
-            assert(hw.pid)
+            assert hw.pid
             content = hw.sock.recv(4096)
             if content:
                 lines = (hw.leftover + content).split(b('\n'))
@@ -319,8 +376,11 @@ def main(latency_control, latency_buffer_size, auto_hosts, to_nameserver,
 
         def got_host_req(data):
             if not hw.pid:
-                (hw.pid, hw.sock) = start_hostwatch(
+                started = start_hostwatch(
                         data.decode("ASCII").strip().split(), auto_hosts)
+                if started is None:
+                    return
+                (hw.pid, hw.sock) = started
                 handlers.append(Handler(socks=[hw.sock],
                                         callback=hostwatch_ready))
         mux.got_host_req = got_host_req
@@ -335,7 +395,17 @@ def main(latency_control, latency_buffer_size, auto_hosts, to_nameserver,
             if family != socket.AF_INET:
                 family = socket.AF_INET6
             dstport = int(dstport)
-            outwrap = ssnet.connect_dst(family, dstip, dstport)
+            try:
+                outwrap = ssnet.connect_dst(family, dstip, dstport)
+            except OSError as e:
+                if e.errno not in OUT_OF_FILES:
+                    raise
+                log('warning: too many open files.  Discarded connection '
+                    'to %s:%d.' % (dstip, dstport))
+                # Nothing will come from us, and we want nothing more.
+                mux.send(channel, ssnet.CMD_TCP_EOF, b(''))
+                mux.send(channel, ssnet.CMD_TCP_STOP_SENDING, b(''))
+                return
             handlers.append(Proxy(MuxWrapper(mux, channel), outwrap))
         mux.new_channel = new_channel
 
@@ -343,7 +413,13 @@ def main(latency_control, latency_buffer_size, auto_hosts, to_nameserver,
 
         def dns_req(channel, data):
             debug2('Incoming DNS request channel=%d.' % channel)
-            h = DnsProxy(mux, channel, data, to_nameserver)
+            try:
+                h = DnsProxy(mux, channel, data, to_nameserver)
+            except OSError as e:
+                if e.errno not in OUT_OF_FILES:
+                    raise
+                log('warning: too many open files.  Discarded DNS request.')
+                return
             handlers.append(h)
             dnshandlers[channel] = h
         mux.got_dns_req = dns_req
@@ -374,14 +450,22 @@ def main(latency_control, latency_buffer_size, auto_hosts, to_nameserver,
                 raise Fatal('UDP connection channel %d already open' %
                             channel)
             else:
-                h = UdpProxy(mux, channel, family)
+                try:
+                    h = UdpProxy(mux, channel, family)
+                except OSError as e:
+                    if e.errno not in OUT_OF_FILES:
+                        raise
+                    log('warning: too many open files.  Discarded UDP '
+                        'channel %d.' % channel)
+                    del mux.channels[channel]
+                    return
                 handlers.append(h)
                 udphandlers[channel] = h
         mux.got_udp_open = udp_open
 
         while mux.ok:
             if hw.pid:
-                assert(hw.pid > 0)
+                assert hw.pid > 0
                 (rpid, rv) = os.waitpid(hw.pid, os.WNOHANG)
                 if rpid:
                     raise Fatal(

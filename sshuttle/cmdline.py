@@ -1,6 +1,9 @@
+import os
 import re
+import shlex
 import socket
-import platform
+import sys
+from argparse import ArgumentTypeError
 import sshuttle.helpers as helpers
 import sshuttle.client as client
 import sshuttle.firewall as firewall
@@ -9,25 +12,21 @@ import sshuttle.ssyslog as ssyslog
 from sshuttle.options import parser, parse_ipport
 from sshuttle.helpers import family_ip_tuple, log, Fatal
 from sshuttle.sudoers import sudoers
+from sshuttle.namespace import enter_namespace
 
 
 def main():
-    opt = parser.parse_args()
+    if 'SSHUTTLE_ARGS' in os.environ:
+        env_args = shlex.split(os.environ['SSHUTTLE_ARGS'])
+    else:
+        env_args = []
+    args = [*env_args, *sys.argv[1:]]
 
-    if opt.sudoers or opt.sudoers_no_modify:
-        if platform.platform().startswith('OpenBSD'):
-            log('Automatic sudoers does not work on BSD')
-            return 1
+    opt = parser.parse_args(args)
 
-        if not opt.sudoers_filename:
-            log('--sudoers-file must be set or omitted.')
-            return 1
-
-        sudoers(
-            user_name=opt.sudoers_user,
-            no_modify=opt.sudoers_no_modify,
-            file_name=opt.sudoers_filename
-        )
+    if opt.sudoers_no_modify:
+        # sudoers() calls exit() when it completes
+        sudoers(user_name=opt.sudoers_user)
 
     if opt.daemon:
         opt.syslog = 1
@@ -40,12 +39,23 @@ def main():
     helpers.verbose = opt.verbose
 
     try:
+        # Since namespace and namespace-pid options are only available
+        # in linux, we must check if it exists with getattr
+        namespace = getattr(opt, 'namespace', None)
+        namespace_pid = getattr(opt, 'namespace_pid', None)
+        if namespace or namespace_pid:
+            prefix = helpers.logprefix
+            helpers.logprefix = 'ns: '
+            enter_namespace(namespace, namespace_pid)
+            helpers.logprefix = prefix
+
         if opt.firewall:
             if opt.subnets or opt.subnets_file:
                 parser.error('exactly zero arguments expected')
-            return firewall.main(opt.method, opt.syslog)
+            return firewall.main(opt.method, opt.syslog, flush_dns=not opt.no_flush_dns)
         elif opt.hostwatch:
-            return hostwatch.hw_main(opt.subnets, opt.auto_hosts)
+            hostwatch.hw_main(opt.subnets, opt.auto_hosts)
+            return 0
         else:
             # parse_subnetports() is used to create a list of includes
             # and excludes. It is called once for each parameter and
@@ -75,7 +85,10 @@ def main():
                 ipport_v4 = None
                 lst = opt.listen.split(",")
                 for ip in lst:
-                    family, ip, port = parse_ipport(ip)
+                    try:
+                        family, ip, port = parse_ipport(ip)
+                    except ArgumentTypeError as e:
+                        parser.error('argument -l/--listen: %s' % e)
                     if family == socket.AF_INET6:
                         ipport_v6 = (ip, port)
                     else:
@@ -85,9 +98,9 @@ def main():
                 ipport_v4 = "auto"
                 # parse_ipport6('[::1]:0')
                 ipport_v6 = "auto" if not opt.disable_ipv6 else None
-            try:
-                int(opt.tmark, 16)
-            except ValueError:
+            # a 32-bit firewall mark; int(x, 16) alone would also accept
+            # signs, underscores and spaces, which break the firewall rules
+            if not re.fullmatch(r'(0x)?[0-9a-f]{1,8}', opt.tmark, re.I):
                 parser.error("--tmark must be a hexadecimal value")
             opt.tmark = opt.tmark.lower()   # make 'x' in 0x lowercase
             if not opt.tmark.startswith("0x"):  # accept without 0x prefix
@@ -115,8 +128,12 @@ def main():
                                       opt.to_ns,
                                       opt.pidfile,
                                       opt.user,
+                                      opt.group,
                                       opt.sudo_pythonpath,
-                                      opt.tmark)
+                                      opt.add_cmd_delimiter,
+                                      opt.remote_shell,
+                                      opt.tmark,
+                                      flush_dns=not opt.no_flush_dns)
 
             if return_code == 0:
                 log('Normal exit code, exiting...')
